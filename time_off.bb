@@ -1,10 +1,12 @@
 
 (require '[babashka.curl :as curl]
+         '[clojure.data.csv :refer [read-csv]]
          '[clojure.string :as str]
          '[clojure.pprint :refer [pprint]]
          '[cheshire.core :as json]
          '[babashka.tasks :refer [shell]]
          '[clojure.data :refer [diff]])
+(require  '[time-off.helper :as h])
 
 ;; STATE
 (def API-KEY "REDACTED")
@@ -34,15 +36,26 @@
        (map #(update % :name str/replace #" " "_"))))
 
 (defn ->entry
-  [date projectId]
+  [date projectId note]
   {:id nil
    :dailyEntryId 1
-   :date (str "2023-01-" date)
+   :date date
    :employeeId (:employee-id @data)
    :hours 8
    :note ""
    :projectId projectId
    :taskId nil})
+
+(defn extract-current-month
+  [timesheet]
+  (->> timesheet
+       :timesheet
+       :dailyDetails
+       vals
+       first
+       :date
+       (re-matches #"(\d{4}-\d{2}).*")
+       second))
 
 (defn get-upload-headers
   []
@@ -52,7 +65,7 @@
 
 ;; UI
 (defn header [msg]
-  (printf "\033c")
+  ;;(printf "\033c")
   (shell (format "gum style --padding 1 --foreground 212 '%s'" msg)))
 
 (defn input [& {:keys [value placeholder] :or {value "" placeholder ""}}]
@@ -68,7 +81,7 @@
       str/trim))
 
 (defn table [csv]
-  (let [data (csv/read-csv csv)
+  (let [data (read-csv csv)
         headers (->> data
                      first
                      (map str/upper-case))
@@ -100,28 +113,28 @@
   (:body (curl/get (str URL "/home")
                  {:headers @headers})))
 
-(defn set-csrf-token!
+(defn retrieve-csrf-token!
   [home-body]
   (->> home-body
        (re-find #"CSRF_TOKEN = \"(.*)\".*;")
        second
        (swap! headers assoc :x-csrf-token)))
 
-(defn set-employee-id!
+(defn retrieve-employee-id!
   [home-body]
   (->> home-body
        (re-find #"\"employeeId\":\"(\d*)\"")
        second
        (swap! data assoc :employee-id)))
 
-(defn set-time-tracking-id!
+(defn retrieve-time-tracking-id!
   [home-body]
   (->> home-body
        (re-find #"window.time_tracking.*\"id\":(\d*)")
        second
        (swap! data assoc :time-tracking-id)))
 
-(defn set-projects! 
+(defn retrieve-projects! 
   [home-body]
   (-> home-body
       (->> (re-find #"\"projectsWithTasks\":(.*),\"recentProjectsAndTasks\""))
@@ -133,16 +146,17 @@
 (defn init-data
   []
   (let [home-body (get-home-body)]
-    (set-csrf-token! home-body)
-    (set-employee-id! home-body)
-    (set-time-tracking-id! home-body)
-    (set-projects! home-body)))
+    (retrieve-csrf-token! home-body)
+    (retrieve-employee-id! home-body)
+    (retrieve-time-tracking-id! home-body)
+    (retrieve-projects! home-body)))
 
-(defn get-time-sheet []
+(defn retrieve-time-sheet! []
   (-> (curl/get (str URL "/timesheet/" (:time-tracking-id @data))
                  {:headers @headers})
       :body
-       (json/parse-string true)))
+       (json/parse-string true)
+      (->> (swap! data assoc :timesheet))))
 
 (defn set-entry! [entries]
   (println (json/generate-string {:hours (vec entries)}))
@@ -151,44 +165,55 @@
               :raw-args ["--data-raw" (json/generate-string {:hours (vec entries)})]}))
 
 ;; Sub Programs
-
 (defn view-time-tracking
   []
-  (let [time-sheet (get-time-sheet)]
-    (->> time-sheet
-         :timesheet
-         :dailyDetails
-         vals
-         (map #(select-keys % [:date :totalHours :projectName :timeOffHours :paidHolidayHours]))
-         (sort-by first)
-         (map #(str/join "," (vals %)))
-         (str/join "\n")
-         (str "Date, Hours, Project Name, TimeOffHours, HolidayHours\n")
-         table)))
+  (->> (:timesheet @data)
+       :timesheet
+       :dailyDetails
+       vals
+       (map #(select-keys % [:date :totalHours :projectName :timeOffHours :paidHolidayHours]))
+       (sort-by first)
+       (map #(str/join "," (vals %)))
+       (str/join "\n")
+       (str "Date, Hours, Project Name, TimeOffHours, HolidayHours\n")
+       table))
+
+(defn generate-time-tracking-entries
+  []
+  (let [day-range (input {:value "" :placeholder "Enter a day range (e.g. 14-19, inclusive, no am-pm yet)"})
+        [_ day-start day-end] (re-matches #"^(\d{1,2})\D*(\d{1,2})$" (str/trim day-range))
+        day-range (map #(format "%02d" %) (range (Integer/parseInt day-start) (inc (Integer/parseInt day-end))))
+        project (first (choose (map :name (:projects @data))))
+        project-id (some #(when (= (:name %) project) (:id %)) (:projects @data))
+        note (input {:value "" :placeholder "Enter a note"})]
+    (->> day-range
+         (map #(str (:current-month @data) "-" %))
+         h/partition-weekdays
+         h/print-weekend-and-discard 
+         (map #(->entry % project-id note)))))
 
 (defn add-time-tracking
   []
-  (let [day-start (input {:value "" :placeholder "Enter a start day"})
-        day-end (input {:value "" :placeholder "Enter an end date (inclusive)"})
-        day-range (range (Integer/parseInt day-start) (Integer/parseInt day-end))
-        project (first (choose (map :name (:projects @data))))
-        project-id (some #(when (= (:name %) project) (:id %)) (:projects @data))]
-    (->> (map #(->entry % project-id) day-range)
-         set-entry!
-         doall)))
-
+  (let [entries (generate-time-tracking-entries)]
+    (header "Confirm Entries?")
+    (table (str "Date, ProjectId, TaskId, Hours, Note \n"
+                (str/join "\n"
+                          (map #(str/join "," (vals (select-keys % [:date :projectId :taskId :hours :note]))) entries))))
+    (when (confirm "Push entries to bamboohr?")
+      (set-entry! entries))))
 
 ;; Main Program
 (header "Init")
 (def cookie (input {:placeholder "Please insert cookie: "}))
 (swap! headers assoc :cookie cookie)
 (init-data)
-;;(println (:x-csrf-token @headers) "?")
-;;(println (str/join @data ","))
+(retrieve-time-sheet!)
+(swap! data assoc :current-month (extract-current-month (:timesheet @data)))
 (header "What would you like to do?")
-(def option (choose ["View-Time-tracking"
-                     "Add-Time-Tracking"]))
+
+(def option (choose ["View-Current-TimeSheet"
+                     "Add-To-Current-TimeSheet"]))
 
 (case option
-  ["View-Time-tracking"] (view-time-tracking)
-  ["Add-Time-Tracking"] (add-time-tracking))
+  ["View-Current-TimeSheet"] (view-time-tracking)
+  ["Add-To-Current-TimeSheet"] (add-time-tracking))
