@@ -2,27 +2,20 @@
 (require '[babashka.curl :as curl]
          '[clojure.data.csv :refer [read-csv]]
          '[clojure.string :as str]
-         '[clojure.pprint :refer [pprint]]
          '[cheshire.core :as json]
-         '[babashka.tasks :refer [shell]]
-         '[clojure.data :refer [diff]])
+         '[babashka.tasks :refer [shell]])
 (require  '[time-off.helper :as h])
 
 ;; STATE
-(def API-KEY "REDACTED")
 (def URL "https://juxtpro.bamboohr.com")
-(def API-URL "https://api.bamboohr.com/api/gateway.php/juxtpro/v1")
 (def headers (atom {:authority "juxtpro.bamboohr.com"
                     :accept "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9"
                     :cache-control "max-age=0"
                     :referer "https://juxtpro.bamboohr.com/login.php"
                     :user-agent "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"}))
-
-(def api-headers (atom {:accept "application/json"}))
 (def data (atom {}))
 
 ;; Helper functions 
-
 (defn extract-projects
   [projects]
   (->> projects
@@ -31,20 +24,24 @@
         (fn [acc [_ v]]
           (if (empty? (get-in v [:tasks :allIds]))
             (conj acc (select-keys v [:id :name]))
-            (concat acc (map (fn [[_ v]] (select-keys v [:id :name])) (get-in v [:tasks :byId]))))) 
+            (concat acc (map (fn [[_ {:keys [id name]}]]
+                               {:id (:id v)
+                                :task-id id
+                                :name name})
+                             (get-in v [:tasks :byId]))))) 
         [])
        (map #(update % :name str/replace #" " "_"))))
 
 (defn ->entry
-  [date projectId note]
+  [date project-id task-id note]
   {:id nil
    :dailyEntryId 1
    :date date
    :employeeId (:employee-id @data)
    :hours 8
-   :note ""
-   :projectId projectId
-   :taskId nil})
+   :note note
+   :projectId project-id
+   :taskId task-id})
 
 (defn extract-current-month
   [timesheet]
@@ -57,6 +54,8 @@
        (re-matches #"(\d{4}-\d{2}).*")
        second))
 
+
+
 (defn get-upload-headers
   []
   (-> @headers
@@ -65,7 +64,6 @@
 
 ;; UI
 (defn header [msg]
-  ;;(printf "\033c")
   (shell (format "gum style --padding 1 --foreground 212 '%s'" msg)))
 
 (defn input [& {:keys [value placeholder] :or {value "" placeholder ""}}]
@@ -180,40 +178,50 @@
 
 (defn generate-time-tracking-entries
   []
-  (let [day-range (input {:value "" :placeholder "Enter a day range (e.g. 14-19, inclusive, no am-pm yet)"})
-        [_ day-start day-end] (re-matches #"^(\d{1,2})\D*(\d{1,2})$" (str/trim day-range))
-        day-range (map #(format "%02d" %) (range (Integer/parseInt day-start) (inc (Integer/parseInt day-end))))
+  (let [day-range-string (input {:value "" :placeholder "Enter day range(s) (14-19, 25, 28-31) [inclusive, no am-pm yet]"})
+        day-range (h/generate-day-range day-range-string)
         project (first (choose (map :name (:projects @data))))
-        project-id (some #(when (= (:name %) project) (:id %)) (:projects @data))
+        [project-id task-id] (some #(when (= (:name %) project) [(:id %) (:task-id %)]) (:projects @data)) 
         note (input {:value "" :placeholder "Enter a note"})]
     (->> day-range
          (map #(str (:current-month @data) "-" %))
+         h/partition-over-current-date
+         h/print-over-current-date-and-discard
          h/partition-weekdays
-         h/print-weekend-and-discard 
-         (map #(->entry % project-id note)))))
+         h/print-weekend-and-discard
+         (h/partition-already-booked  (get-in @data [:timesheet :timesheet :dailyDetails]))
+         h/print-already-booked-and-discard
+         (map #(->entry % project-id task-id note)))))
 
 (defn add-time-tracking
   []
   (let [entries (generate-time-tracking-entries)]
-    (header "Confirm Entries?")
-    (table (str "Date, ProjectId, TaskId, Hours, Note \n"
-                (str/join "\n"
-                          (map #(str/join "," (vals (select-keys % [:date :projectId :taskId :hours :note]))) entries))))
-    (when (confirm "Push entries to bamboohr?")
-      (set-entry! entries))))
+    
+    (if-not (empty? entries) 
+      (do
+        (header "Confirm Entries?")
+        (table (str "Date, ProjectId, TaskId, Hours, Note \n"
+                    (str/join "\n"
+                              (map #(str/join "," (vals (select-keys % [:date :projectId :taskId :hours :note]))) entries))))
+        (when (confirm "Push entries to bamboohr?")
+          (set-entry! entries)))
+      (println "No dates to set"))))
 
 ;; Main Program
 (header "Init")
 (def cookie (input {:placeholder "Please insert cookie: "}))
 (swap! headers assoc :cookie cookie)
 (init-data)
-(retrieve-time-sheet!)
-(swap! data assoc :current-month (extract-current-month (:timesheet @data)))
-(header "What would you like to do?")
 
-(def option (choose ["View-Current-TimeSheet"
-                     "Add-To-Current-TimeSheet"]))
+(loop []
+  (retrieve-time-sheet!)
+  (swap! data assoc :current-month (extract-current-month (:timesheet @data)))
+  (header "What would you like to do?")
 
-(case option
-  ["View-Current-TimeSheet"] (view-time-tracking)
-  ["Add-To-Current-TimeSheet"] (add-time-tracking))
+  (def option (choose ["View-Current-TimeSheet"
+                       "Add-To-Current-TimeSheet"]))
+
+  (case option
+    ["View-Current-TimeSheet"] (view-time-tracking)
+    ["Add-To-Current-TimeSheet"] (add-time-tracking))
+  (recur))
