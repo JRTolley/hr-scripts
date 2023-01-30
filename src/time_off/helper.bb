@@ -14,7 +14,7 @@
   weekday)
 
 (def is-already-booked? (fn [m d]
-                          (>= (get-in m [(keyword d) :totalHours]) 8)))
+                          (>= (or (get-in m [(keyword d) :totalHours]) 0) 8)))
 (defn partition-already-booked
   [current-timesheet dates]
   (rename-keys 
